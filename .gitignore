@@ -1,2 +1,7 @@
 .DS_Store
 _minta/
+config.local.php
+logs/
+incoming/
+_enso_imported/
+_enso_error/
