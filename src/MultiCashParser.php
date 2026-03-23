@@ -48,7 +48,26 @@ final class MultiCashParser
                 $transaction['block_index'] = $blockIndex;
                 $transaction['statement_reference'] = $block['statement_reference'];
                 $transaction['account_number'] = $block['account_number'];
-                $transaction['currency'] = $transaction['currency'] ?? $block['currency'];
+
+                if (
+                    (!isset($transaction['currency']) || !is_string($transaction['currency']) || $transaction['currency'] === '')
+                    && isset($block['currency'])
+                    && is_string($block['currency'])
+                    && $block['currency'] !== ''
+                ) {
+                    $transaction['currency'] = $block['currency'];
+                    $transaction['currency_source'] = $transaction['currency_source'] ?? 'block_balance';
+                }
+
+                if (
+                    $currency === null
+                    && isset($transaction['currency'])
+                    && is_string($transaction['currency'])
+                    && $transaction['currency'] !== ''
+                ) {
+                    $currency = $transaction['currency'];
+                }
+
                 $transactions[] = $transaction;
             }
         }
@@ -178,9 +197,22 @@ final class MultiCashParser
         $narrativeDetails = $this->parseNarrative((string) $currentTransaction['raw']['86']);
 
         $currentTransaction['narrative'] = $narrativeDetails['narrative'];
+        $currentTransaction['partner_bank'] = $narrativeDetails['partner_bank'];
         $currentTransaction['partner_name'] = $narrativeDetails['partner_name'];
         $currentTransaction['partner_account'] = $narrativeDetails['partner_account'];
+        $currentTransaction['supplementary_details'] = $narrativeDetails['supplementary_details'];
+        $currentTransaction['unparsed_tail'] = $narrativeDetails['unparsed_tail'];
         $currentTransaction['structured_details'] = $narrativeDetails['structured_details'];
+
+        if (
+            (!isset($currentTransaction['currency']) || !is_string($currentTransaction['currency']) || $currentTransaction['currency'] === '')
+            && isset($narrativeDetails['currency'])
+            && is_string($narrativeDetails['currency'])
+            && $narrativeDetails['currency'] !== ''
+        ) {
+            $currentTransaction['currency'] = $narrativeDetails['currency'];
+            $currentTransaction['currency_source'] = $narrativeDetails['currency_source'];
+        }
 
         $currentBlock['transactions'][] = $currentTransaction;
         $currentTransaction = null;
@@ -275,10 +307,14 @@ final class MultiCashParser
             'customer_reference' => $referenceDetails['customer_reference'],
             'bank_reference' => $referenceDetails['bank_reference'],
             'narrative' => '',
+            'partner_bank' => null,
             'partner_name' => null,
             'partner_account' => null,
             'currency' => null,
+            'currency_source' => null,
+            'supplementary_details' => [],
             'structured_details' => [],
+            'unparsed_tail' => null,
             'raw' => [
                 '61' => trim($line),
                 '86' => '',
@@ -317,21 +353,37 @@ final class MultiCashParser
     }
 
     /**
-     * @return array{narrative:string,partner_name:?string,partner_account:?string,structured_details:array<string, string[]>}
+     * @return array{
+     *     narrative:string,
+     *     partner_bank:?string,
+     *     partner_name:?string,
+     *     partner_account:?string,
+     *     currency:?string,
+     *     currency_source:?string,
+     *     structured_details:array<string, string[]>,
+     *     supplementary_details:array<string, mixed>,
+     *     unparsed_tail:?string
+     * }
      */
     private function parseNarrative(string $rawNarrative): array
     {
         if ($rawNarrative === '') {
             return [
                 'narrative' => '',
+                'partner_bank' => null,
                 'partner_name' => null,
                 'partner_account' => null,
+                'currency' => null,
+                'currency_source' => null,
                 'structured_details' => [],
+                'supplementary_details' => [],
+                'unparsed_tail' => null,
             ];
         }
 
         $structured = [];
         $compact = preg_replace('/^\d{3}(?=\?\d{2})/', '', $rawNarrative) ?? $rawNarrative;
+        [$compact, $tail] = $this->splitNarrativeTail($compact);
 
         if (preg_match_all('/\?(\d{2})(.*?)(?=\?\d{2}|$)/s', $compact, $matches, PREG_SET_ORDER) === false) {
             throw new RuntimeException('Unable to parse :86: narrative.');
@@ -364,7 +416,7 @@ final class MultiCashParser
             }
         }
 
-        $partnerAccountSegments = array_merge($structured['30'] ?? [], $structured['31'] ?? []);
+        $partnerBank = $this->joinSegments($structured['30'] ?? []);
         $partnerNameSegments = [];
 
         foreach (['32', '33', '34', '35', '36', '37', '38', '39'] as $code) {
@@ -377,13 +429,21 @@ final class MultiCashParser
             }
         }
 
+        $supplementaryDetails = $this->parseNarrativeTail($tail);
+        [$detectedCurrency, $currencySource] = $this->detectNarrativeCurrency($structured, $supplementaryDetails);
+
         return [
             'narrative' => trim(implode(' ', $narrativeSegments)),
+            'partner_bank' => $partnerBank,
             'partner_name' => $partnerNameSegments === [] ? null : trim(implode(' ', $partnerNameSegments)),
-            'partner_account' => $partnerAccountSegments === []
-                ? null
-                : preg_replace('/\s+/', '', implode('', $partnerAccountSegments)),
+            'partner_account' => $this->detectPartnerAccount($structured),
+            'currency' => $detectedCurrency,
+            'currency_source' => $currencySource,
             'structured_details' => $structured,
+            'supplementary_details' => $supplementaryDetails,
+            'unparsed_tail' => isset($supplementaryDetails['unparsed_tail']) && is_string($supplementaryDetails['unparsed_tail'])
+                ? $supplementaryDetails['unparsed_tail']
+                : null,
         ];
     }
 
@@ -456,5 +516,195 @@ final class MultiCashParser
         $value = preg_replace('/\s+/u', ' ', $value) ?? $value;
 
         return trim($value);
+    }
+
+    /**
+     * @return array{0:string,1:string}
+     */
+    private function splitNarrativeTail(string $narrative): array
+    {
+        $tailStart = null;
+
+        foreach (['?/OCMT/', ':NS:'] as $marker) {
+            $position = strpos($narrative, $marker);
+
+            if ($position === false) {
+                continue;
+            }
+
+            if ($tailStart === null || $position < $tailStart) {
+                $tailStart = $position;
+            }
+        }
+
+        if ($tailStart === null) {
+            return [$narrative, ''];
+        }
+
+        return [
+            substr($narrative, 0, $tailStart),
+            substr($narrative, $tailStart),
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function parseNarrativeTail(string $tail): array
+    {
+        if ($tail === '') {
+            return [];
+        }
+
+        $details = [
+            'raw_tail' => $tail,
+        ];
+        $remaining = $tail;
+
+        if (
+            preg_match(
+                '/\?\/OCMT\/(?P<ocmt_currency>[A-Z]{3})(?P<ocmt_amount>\d+(?:,\d+)?)(?:\/\/CHGS\/(?P<charges_currency>[A-Z]{3})(?P<charges_amount>\d+(?:,\d+)?))?/',
+                $remaining,
+                $matches
+            ) === 1
+        ) {
+            $details['ocmt_currency'] = (string) $matches['ocmt_currency'];
+            $details['ocmt_amount'] = $this->parseNarrativeAmount((string) $matches['ocmt_amount']);
+
+            if (isset($matches['charges_currency']) && $matches['charges_currency'] !== '') {
+                $details['charges_currency'] = (string) $matches['charges_currency'];
+            }
+
+            if (isset($matches['charges_amount']) && $matches['charges_amount'] !== '') {
+                $details['charges_amount'] = $this->parseNarrativeAmount((string) $matches['charges_amount']);
+            }
+
+            $remaining = str_replace($matches[0], '', $remaining);
+        }
+
+        if (preg_match('/:NS:(?P<ns>[A-Za-z0-9+\/-]+)/', $remaining, $matches) === 1) {
+            $details['ns'] = (string) $matches['ns'];
+            $remaining = str_replace($matches[0], '', $remaining);
+        }
+
+        $remaining = $this->cleanText($remaining);
+
+        if ($remaining !== '') {
+            $details['unparsed_tail'] = $remaining;
+        }
+
+        return $details;
+    }
+
+    /**
+     * @param array<string, string[]> $structured
+     * @param array<string, mixed> $supplementaryDetails
+     * @return array{0:?string,1:?string}
+     */
+    private function detectNarrativeCurrency(array $structured, array $supplementaryDetails): array
+    {
+        if (isset($supplementaryDetails['ocmt_currency']) && is_string($supplementaryDetails['ocmt_currency']) && $supplementaryDetails['ocmt_currency'] !== '') {
+            return [$supplementaryDetails['ocmt_currency'], 'narrative_tail_ocmt'];
+        }
+
+        foreach ($structured as $code => $segments) {
+            if ((int) $code >= 30) {
+                continue;
+            }
+
+            foreach ($segments as $segment) {
+                $currency = $this->extractCurrencyFromSegment($segment);
+
+                if ($currency !== null) {
+                    return [$currency, 'field_' . $code];
+                }
+            }
+        }
+
+        if (isset($supplementaryDetails['charges_currency']) && is_string($supplementaryDetails['charges_currency']) && $supplementaryDetails['charges_currency'] !== '') {
+            return [$supplementaryDetails['charges_currency'], 'narrative_tail_chgs'];
+        }
+
+        return [null, null];
+    }
+
+    private function extractCurrencyFromSegment(string $segment): ?string
+    {
+        $patterns = [
+            '/\b\d+(?:,\d+)?\s+([A-Z]{3})\b/',
+            '/\b([A-Z]{3})\s+\d+(?:,\d+)?\b/',
+            '/\b([A-Z]{3})(?=\d)/',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $segment, $matches) === 1) {
+                return (string) $matches[1];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string, string[]> $structured
+     */
+    private function detectPartnerAccount(array $structured): ?string
+    {
+        foreach (['31', '30'] as $code) {
+            if (!isset($structured[$code])) {
+                continue;
+            }
+
+            foreach ($structured[$code] as $segment) {
+                $normalized = $this->normalizeAccountValue($segment);
+
+                if ($normalized === null) {
+                    continue;
+                }
+
+                if ($code === '31' || $this->looksLikeAccountNumber($normalized)) {
+                    return $normalized;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param string[] $segments
+     */
+    private function joinSegments(array $segments): ?string
+    {
+        $segments = array_values(array_filter($segments, static function ($segment): bool {
+            return is_string($segment) && $segment !== '';
+        }));
+
+        if ($segments === []) {
+            return null;
+        }
+
+        return trim(implode(' ', $segments));
+    }
+
+    private function normalizeAccountValue(string $value): ?string
+    {
+        $normalized = preg_replace('/\s+/', '', $value);
+
+        if ($normalized === null || $normalized === '') {
+            return null;
+        }
+
+        return $normalized;
+    }
+
+    private function looksLikeAccountNumber(string $value): bool
+    {
+        return preg_match('/^[A-Z0-9]{8,34}$/', $value) === 1;
+    }
+
+    private function parseNarrativeAmount(string $value): float
+    {
+        return (float) str_replace(',', '.', $value);
     }
 }

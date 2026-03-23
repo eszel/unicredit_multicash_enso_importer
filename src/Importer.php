@@ -81,16 +81,36 @@ final class Importer
                 }
 
                 $parsedFile = $this->parser->parseFile($workingPath);
-                $payload = $this->payloadBuilder->build($parsedFile);
+                $buildResult = $this->payloadBuilder->buildWithDiagnostics($parsedFile);
+                $payload = $buildResult['payload'];
+                $diagnostics = $buildResult['diagnostics'];
 
                 $this->logger->info('File parsed successfully.', [
                     'file' => basename($workingPath),
+                    'encoding' => $parsedFile['encoding'],
                     'blocks' => $parsedFile['block_count'],
                     'transactions' => $parsedFile['transaction_count'],
+                    'detected_currency' => $parsedFile['currency'],
                 ]);
 
                 $itemCount = isset($payload['items']) && is_array($payload['items']) ? count($payload['items']) : 0;
                 $skippedCount = (int) $parsedFile['transaction_count'] - $itemCount;
+                $apiTarget = rtrim((string) $this->config['enso']['base_url'], '/') . '/' . ltrim((string) $this->config['enso']['endpoint'], '/');
+
+                foreach ($diagnostics as $diagnostic) {
+                    $this->logger->info('Transaction diagnostic.', [
+                        'file' => basename($workingPath),
+                        'diagnostic' => $diagnostic,
+                    ]);
+                }
+
+                $this->logger->info('ENSO request payload prepared.', [
+                    'file' => basename($workingPath),
+                    'url' => $apiTarget,
+                    'items' => $itemCount,
+                    'skipped_transactions' => $skippedCount,
+                    'payload' => $payload,
+                ]);
 
                 if ($itemCount === 0) {
                     $this->logger->info('No importable bank statement items remained after filtering.', [
@@ -111,6 +131,7 @@ final class Importer
                             'api_items' => $itemCount,
                             'skipped_transactions' => $skippedCount,
                         ],
+                        'payload' => $payload,
                     ]);
 
                     continue;
@@ -120,9 +141,13 @@ final class Importer
 
                 $this->logger->info('ENSO import request succeeded.', [
                     'file' => basename($workingPath),
+                    'url' => $apiTarget,
                     'items' => $itemCount,
                     'skipped_transactions' => $skippedCount,
                     'status_code' => $response['status_code'],
+                    'content_type' => $response['content_type'],
+                    'response_json' => $response['json'],
+                    'response_body' => $response['body'],
                 ]);
             } catch (Throwable $throwable) {
                 $context = [

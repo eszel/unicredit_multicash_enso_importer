@@ -9,6 +9,7 @@ Egyszeru PHP 7.4 CLI importalo, ami a MultiCash 3.22 kimeneti fajlokat feldolgoz
 - a talalt fajlokat azonnal atmozgatja `_enso_imported` ala
 - a fajlokat MT940/MultiCash logika szerint tranzakciokra bontja
 - a normalizalt bankkivonat sorokat egyetlen bulk HTTP keressel kuldi az ENSO API-nak
+- tetelenkent diagnosztikai logot ir a felismert, hianyzo es nyers mezokrol, valamint a kepzett API payloadrol
 - hiba eseten a hibas fajlt `_enso_error` ala mozgatja, majd leall
 
 ## Hasznalat

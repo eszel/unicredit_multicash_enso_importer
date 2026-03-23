@@ -31,15 +31,42 @@ final class EnsoPayloadBuilder
      */
     public function build(array $parsedFile): array
     {
-        $items = [];
+        $result = $this->buildWithDiagnostics($parsedFile);
 
-        foreach ($parsedFile['blocks'] as $block) {
-            foreach ($block['transactions'] as $transaction) {
-                if ($this->onlyCreditTransactions && $transaction['direction'] !== 'credit') {
-                    continue;
+        return $result['payload'];
+    }
+
+    /**
+     * @param array<string, mixed> $parsedFile
+     * @return array{payload:array<string, mixed>,diagnostics:array<int, array<string, mixed>>}
+     */
+    public function buildWithDiagnostics(array $parsedFile): array
+    {
+        $items = [];
+        $diagnostics = [];
+
+        foreach ($parsedFile['blocks'] as $blockIndex => $block) {
+            foreach ($block['transactions'] as $transactionIndex => $transaction) {
+                $willSend = !$this->onlyCreditTransactions || $transaction['direction'] === 'credit';
+                $payloadItem = null;
+                $payloadIndex = null;
+
+                if ($willSend) {
+                    $payloadItem = $this->mapTransaction($transaction, $block, (string) $parsedFile['file_name']);
+                    $items[] = $payloadItem;
+                    $payloadIndex = count($items) - 1;
                 }
 
-                $items[] = $this->mapTransaction($transaction, $block, (string) $parsedFile['file_name']);
+                $diagnostics[] = $this->buildTransactionDiagnostic(
+                    $transaction,
+                    $block,
+                    (string) $parsedFile['file_name'],
+                    (int) $blockIndex,
+                    (int) $transactionIndex,
+                    $willSend,
+                    $payloadIndex,
+                    $payloadItem
+                );
             }
         }
 
@@ -51,7 +78,10 @@ final class EnsoPayloadBuilder
             ));
         }
 
-        return ['items' => $items];
+        return [
+            'payload' => ['items' => $items],
+            'diagnostics' => $diagnostics,
+        ];
     }
 
     /**
@@ -62,7 +92,8 @@ final class EnsoPayloadBuilder
     private function mapTransaction(array $transaction, array $block, string $fileName): array
     {
         $reference = $transaction['bank_reference'] ?? $transaction['customer_reference'];
-        $currency = $transaction['currency'] ?? $block['currency'] ?? $this->defaultCurrency;
+        $resolvedCurrency = $this->resolveCurrency($transaction, $block);
+        $currency = $resolvedCurrency['currency'];
         $narrative = $transaction['narrative'] !== '' ? $transaction['narrative'] : ($transaction['customer_reference'] ?? null);
 
         return [
@@ -76,6 +107,75 @@ final class EnsoPayloadBuilder
             'tranz_id' => $this->truncate($this->normalizeText($reference), 50),
             'fajlnev' => $this->truncate($fileName, 255),
             'forras_sor' => $this->buildSourceRow($transaction),
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $transaction
+     * @param array<string, mixed> $block
+     * @param array<string, mixed>|null $payloadItem
+     * @return array<string, mixed>
+     */
+    private function buildTransactionDiagnostic(
+        array $transaction,
+        array $block,
+        string $fileName,
+        int $blockIndex,
+        int $transactionIndex,
+        bool $willSend,
+        ?int $payloadIndex,
+        ?array $payloadItem
+    ): array {
+        $resolvedCurrency = $this->resolveCurrency($transaction, $block);
+        $recognized = [
+            'statement_reference' => $block['statement_reference'] ?? null,
+            'account_number' => $block['account_number'] ?? null,
+            'booking_date' => $transaction['booking_date'] ?? null,
+            'entry_date' => $transaction['entry_date'] ?? null,
+            'direction' => $transaction['direction'] ?? null,
+            'amount' => isset($transaction['amount']) ? round((float) $transaction['amount'], 2) : null,
+            'currency' => $resolvedCurrency['currency'],
+            'currency_source' => $resolvedCurrency['source'],
+            'transaction_code' => $transaction['transaction_code'] ?? null,
+            'customer_reference' => $transaction['customer_reference'] ?? null,
+            'bank_reference' => $transaction['bank_reference'] ?? null,
+            'narrative' => $transaction['narrative'] ?? null,
+            'partner_bank' => $transaction['partner_bank'] ?? null,
+            'partner_account' => $transaction['partner_account'] ?? null,
+            'partner_name' => $transaction['partner_name'] ?? null,
+            'supplementary_details' => $transaction['supplementary_details'] ?? [],
+            'unparsed_tail' => $transaction['unparsed_tail'] ?? null,
+        ];
+
+        return [
+            'file_name' => $fileName,
+            'block_index' => $blockIndex,
+            'transaction_index' => $transactionIndex,
+            'will_send_to_api' => $willSend,
+            'skip_reason' => $willSend ? null : 'filtered_by_only_credit_transactions',
+            'api_payload_index' => $payloadIndex,
+            'recognized_fields' => $this->filterRecognizedFields($recognized),
+            'missing_fields' => $this->collectMissingFields($recognized, [
+                'statement_reference',
+                'account_number',
+                'booking_date',
+                'direction',
+                'amount',
+                'currency',
+                'transaction_code',
+                'customer_reference',
+                'bank_reference',
+                'narrative',
+                'partner_account',
+                'partner_name',
+            ]),
+            'optional_missing_fields' => $this->collectMissingFields($recognized, [
+                'entry_date',
+                'partner_bank',
+            ]),
+            'structured_details' => $transaction['structured_details'] ?? [],
+            'raw_fields' => $transaction['raw'] ?? [],
+            'api_item' => $payloadItem,
         ];
     }
 
@@ -129,6 +229,95 @@ final class EnsoPayloadBuilder
         }
 
         return $normalized;
+    }
+
+    /**
+     * @param array<string, mixed> $transaction
+     * @param array<string, mixed> $block
+     * @return array{currency:?string,source:?string}
+     */
+    private function resolveCurrency(array $transaction, array $block): array
+    {
+        if (isset($transaction['currency']) && is_string($transaction['currency']) && $transaction['currency'] !== '') {
+            return [
+                'currency' => $transaction['currency'],
+                'source' => isset($transaction['currency_source']) && is_string($transaction['currency_source']) && $transaction['currency_source'] !== ''
+                    ? $transaction['currency_source']
+                    : 'transaction',
+            ];
+        }
+
+        if (isset($block['currency']) && is_string($block['currency']) && $block['currency'] !== '') {
+            return [
+                'currency' => $block['currency'],
+                'source' => 'block_balance',
+            ];
+        }
+
+        if ($this->defaultCurrency !== null && $this->defaultCurrency !== '') {
+            return [
+                'currency' => $this->defaultCurrency,
+                'source' => 'config_default',
+            ];
+        }
+
+        return [
+            'currency' => null,
+            'source' => null,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $recognized
+     * @return array<string, mixed>
+     */
+    private function filterRecognizedFields(array $recognized): array
+    {
+        return array_filter($recognized, function ($value): bool {
+            return !$this->isMissingValue($value);
+        });
+    }
+
+    /**
+     * @param array<string, mixed> $recognized
+     * @param string[] $fields
+     * @return string[]
+     */
+    private function collectMissingFields(array $recognized, array $fields): array
+    {
+        $missing = [];
+
+        foreach ($fields as $field) {
+            $value = $recognized[$field] ?? null;
+
+            if (!$this->isMissingValue($value)) {
+                continue;
+            }
+
+            $missing[] = $field;
+        }
+
+        return $missing;
+    }
+
+    /**
+     * @param mixed $value
+     */
+    private function isMissingValue($value): bool
+    {
+        if ($value === null) {
+            return true;
+        }
+
+        if (is_string($value)) {
+            return trim($value) === '';
+        }
+
+        if (is_array($value)) {
+            return $value === [];
+        }
+
+        return false;
     }
 
     private function truncate(?string $value, int $maxLength): ?string
