@@ -47,7 +47,9 @@ final class EnsoPayloadBuilder
 
         foreach ($parsedFile['blocks'] as $blockIndex => $block) {
             foreach ($block['transactions'] as $transactionIndex => $transaction) {
-                $willSend = !$this->onlyCreditTransactions || $transaction['direction'] === 'credit';
+                $eligibility = $this->evaluateTransactionEligibility($transaction);
+                $willSend = $eligibility['will_send'];
+                $skipReason = $eligibility['skip_reason'];
                 $payloadItem = null;
                 $payloadIndex = null;
 
@@ -64,6 +66,7 @@ final class EnsoPayloadBuilder
                     (int) $blockIndex,
                     (int) $transactionIndex,
                     $willSend,
+                    $skipReason,
                     $payloadIndex,
                     $payloadItem
                 );
@@ -123,6 +126,7 @@ final class EnsoPayloadBuilder
         int $blockIndex,
         int $transactionIndex,
         bool $willSend,
+        ?string $skipReason,
         ?int $payloadIndex,
         ?array $payloadItem
     ): array {
@@ -152,7 +156,7 @@ final class EnsoPayloadBuilder
             'block_index' => $blockIndex,
             'transaction_index' => $transactionIndex,
             'will_send_to_api' => $willSend,
-            'skip_reason' => $willSend ? null : 'filtered_by_only_credit_transactions',
+            'skip_reason' => $skipReason,
             'api_payload_index' => $payloadIndex,
             'recognized_fields' => $this->filterRecognizedFields($recognized),
             'missing_fields' => $this->collectMissingFields($recognized, [
@@ -176,6 +180,35 @@ final class EnsoPayloadBuilder
             'structured_details' => $transaction['structured_details'] ?? [],
             'raw_fields' => $transaction['raw'] ?? [],
             'api_item' => $payloadItem,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $transaction
+     * @return array{will_send:bool,skip_reason:?string}
+     */
+    private function evaluateTransactionEligibility(array $transaction): array
+    {
+        if ($this->onlyCreditTransactions && (($transaction['direction'] ?? null) !== 'credit')) {
+            return [
+                'will_send' => false,
+                'skip_reason' => 'filtered_by_only_credit_transactions',
+            ];
+        }
+
+        $partnerAccount = $this->normalizeAccount($transaction['partner_account'] ?? null);
+        $partnerName = $this->normalizeText($transaction['partner_name'] ?? null);
+
+        if ($partnerAccount === null && $partnerName === null) {
+            return [
+                'will_send' => false,
+                'skip_reason' => 'filtered_missing_partner_data',
+            ];
+        }
+
+        return [
+            'will_send' => true,
+            'skip_reason' => null,
         ];
     }
 
