@@ -7,6 +7,11 @@ use RuntimeException;
 final class MultiCashParser
 {
     /** @var string[] */
+    private const DISALLOWED_CURRENCY_CODES = ['IZV'];
+    /** @var string[] */
+    private const NARRATIVE_CURRENCY_FIELD_CODES = ['20', '21', '22', '23'];
+
+    /** @var string[] */
     private array $encodingCandidates;
 
     /**
@@ -603,16 +608,20 @@ final class MultiCashParser
      */
     private function detectNarrativeCurrency(array $structured, array $supplementaryDetails): array
     {
-        if (isset($supplementaryDetails['ocmt_currency']) && is_string($supplementaryDetails['ocmt_currency']) && $supplementaryDetails['ocmt_currency'] !== '') {
+        if (
+            isset($supplementaryDetails['ocmt_currency'])
+            && is_string($supplementaryDetails['ocmt_currency'])
+            && $this->isAllowedCurrencyCode($supplementaryDetails['ocmt_currency'])
+        ) {
             return [$supplementaryDetails['ocmt_currency'], 'narrative_tail_ocmt'];
         }
 
-        foreach ($structured as $code => $segments) {
-            if ((int) $code >= 30) {
+        foreach (self::NARRATIVE_CURRENCY_FIELD_CODES as $code) {
+            if (!isset($structured[$code])) {
                 continue;
             }
 
-            foreach ($segments as $segment) {
+            foreach ($structured[$code] as $segment) {
                 $currency = $this->extractCurrencyFromSegment($segment);
 
                 if ($currency !== null) {
@@ -621,7 +630,11 @@ final class MultiCashParser
             }
         }
 
-        if (isset($supplementaryDetails['charges_currency']) && is_string($supplementaryDetails['charges_currency']) && $supplementaryDetails['charges_currency'] !== '') {
+        if (
+            isset($supplementaryDetails['charges_currency'])
+            && is_string($supplementaryDetails['charges_currency'])
+            && $this->isAllowedCurrencyCode($supplementaryDetails['charges_currency'])
+        ) {
             return [$supplementaryDetails['charges_currency'], 'narrative_tail_chgs'];
         }
 
@@ -632,17 +645,30 @@ final class MultiCashParser
     {
         $patterns = [
             '/\b\d+(?:,\d+)?\s+([A-Z]{3})\b/',
-            '/\b([A-Z]{3})\s+\d+(?:,\d+)?\b/',
-            '/\b([A-Z]{3})(?=\d)/',
         ];
 
         foreach ($patterns as $pattern) {
             if (preg_match($pattern, $segment, $matches) === 1) {
-                return (string) $matches[1];
+                $currency = (string) $matches[1];
+
+                if ($this->isAllowedCurrencyCode($currency)) {
+                    return $currency;
+                }
             }
         }
 
         return null;
+    }
+
+    private function isAllowedCurrencyCode(string $currency): bool
+    {
+        $currency = strtoupper(trim($currency));
+
+        if ($currency === '' || preg_match('/^[A-Z]{3}$/', $currency) !== 1) {
+            return false;
+        }
+
+        return !in_array($currency, self::DISALLOWED_CURRENCY_CODES, true);
     }
 
     /**
